@@ -21,20 +21,28 @@ type Client struct {
 	local  *tuf.TufRepo
 	remote store.RemoteStore
 	keysDB *keys.KeyDB
+	cache  *store.FileCacheStore
 }
 
-func NewClient(local *tuf.TufRepo, remote store.RemoteStore, keysDB *keys.KeyDB) *Client {
+func NewClient(local *tuf.TufRepo, remote store.RemoteStore, keysDB *keys.KeyDB, cachePath string) *Client {
+	cache := store.NewFileCacheStore(cachePath)
 	return &Client{
 		local:  local,
 		remote: remote,
 		keysDB: keysDB,
+		cache:  cache,
 	}
 }
 
-// Update an in memory copy of the TUF Repo. If an error is returned, the
-// Client instance should be considered corrupted and discarded as it may
-// be left in a partially updated state
 func (c *Client) Update() error {
+	// 1. Get timestamp
+	//   a. If timestamp error (verification, expired, etc...) download new root and return to 1.
+	// 2. Check if local snapshot is up to date
+	//   a. If out of data, get updated snapshot
+	//     i. If snapshot error, download new root and return to 1.
+	// 3. Check if root correct against snapshot
+	//   a. If incorrect, download new root and return to 1.
+	// 4. Iteratively download and search targets and delegations to find target meta
 	err := c.update()
 	if err != nil {
 		switch err.(type) {
@@ -51,7 +59,10 @@ func (c *Client) Update() error {
 	}
 	// If we error again, we now have the latest root and just want to fail
 	// out as there's no expectation the problem can be resolved automatically
-	return c.update()
+	c.update()
+	if err != nil {
+		return err
+	}
 }
 
 func (c *Client) update() error {
@@ -69,6 +80,7 @@ func (c *Client) update() error {
 	if err != nil {
 		return err
 	}
+	// will always need top level targets at a minimum
 	err = c.downloadTargets("targets")
 	if err != nil {
 		logrus.Errorf("Client Update (Targets): ", err.Error())
@@ -169,25 +181,34 @@ func (c *Client) downloadTargets(role string) error {
 	if err != nil {
 		return err
 	}
-	t := c.local.Targets[role].Signed
-	for _, r := range t.Delegations.Roles {
-		err := c.downloadTargets(r.Name)
-		if err != nil {
-			logrus.Error("Failed to download ", role, err)
-			return err
-		}
-	}
+
 	return nil
 }
 
 func (c Client) GetTargetsFile(roleName string, keyIDs []string, snapshotMeta data.Files, consistent bool, threshold int) (*data.Signed, error) {
-	rolePath, err := c.RoleTargetsPath(roleName, snapshotMeta, consistent)
-	if err != nil {
-		return nil, err
+	// require role exists in snapshots
+	roleMeta, ok := snapshotMeta[roleName]
+	if !ok {
+		return nil, fmt.Errorf("Snapshot does not contain target role")
 	}
-	r, err := c.remote.GetMeta(rolePath, snapshotMeta[roleName].Length)
-	if err != nil {
-		return nil, err
+	hashSha256, ok := hashes["sha256"]
+	if !ok {
+		return "", fmt.Errorf("Consistent Snapshots Enabled and sha256 not found for targets file in snapshot meta")
+	}
+
+	// try to get meta file from content addressed cache
+	r, err := c.cache.Get(hashSha256, roleMeta.Length)
+	if err != nil || len(r) == 0 {
+		rolePath, err := c.RoleTargetsPath(roleName, hashSha256, consistent)
+		if err != nil {
+			return nil, err
+		}
+		//roleSha256, err :=
+		r, err := c.remote.GetMeta(rolePath, snapshotMeta[roleName].Length)
+		if err != nil {
+			return nil, err
+		}
+		c.cache.Set(hashSha256, r)
 	}
 	s := &data.Signed{}
 	err = json.Unmarshal(r, s)
@@ -202,15 +223,10 @@ func (c Client) GetTargetsFile(roleName string, keyIDs []string, snapshotMeta da
 	return s, nil
 }
 
-func (c Client) RoleTargetsPath(roleName string, snapshotMeta data.Files, consistent bool) (string, error) {
+// RoleTargetsPath generates the appropriate filename for the targes file,
+// based on whether the repo is marked as consistent.
+func (c Client) RoleTargetsPath(roleName string, hashSha256 string, consistent bool) (string, error) {
 	if consistent {
-		roleMeta, ok := snapshotMeta[roleName]
-		if !ok {
-			return "", fmt.Errorf("Consistent Snapshots Enabled but no meta found for target role")
-		}
-		if _, ok := roleMeta.Hashes["sha256"]; !ok {
-			return "", fmt.Errorf("Consistent Snapshots Enabled and sha256 not found for targets file in snapshot meta")
-		}
 		dir := filepath.Dir(roleName)
 		if strings.Contains(roleName, "/") {
 			lastSlashIdx := strings.LastIndex(roleName, "/")
@@ -218,14 +234,41 @@ func (c Client) RoleTargetsPath(roleName string, snapshotMeta data.Files, consis
 		}
 		roleName = path.Join(
 			dir,
-			fmt.Sprintf("%s.%s.json", roleMeta.Hashes["sha256"], roleName),
+			fmt.Sprintf("%s.%s.json", hasheSha256, roleName),
 		)
 	}
 	return roleName, nil
 }
 
-func (c Client) TargetMeta(path string) *data.FileMeta {
-	return c.local.FindTarget(path)
+// TargetMeta ensures the repo is up to date, downloading the minimum
+// necessary metadata files
+func (c Client) TargetMeta(path string) (*data.FileMeta, error) {
+	c.Update()
+	var meta *data.FileMeta
+
+	// FIFO list of targets delegations to inspect for target
+	roles := []string{data.ValidRoles["targets"]}
+	for ; len(roles) > 0; role := roles[0] {
+		roles = roles[1:]
+		// Download the target role file if necessary
+		err = c.downloadTargets(role)
+		if err != nil {
+			// as long as we find a valid target somewhere we're happy.
+			// continue and search other delegated roles if any
+			continue
+		}
+
+		meta = c.local.TargetMeta(role, path)
+		if meta != nil {
+			// we found the target!
+			break
+		}
+		delegations := c.local.TargetDelegations(role, path, pathHex)
+		for _, d := range delegations {
+			roles = append(roles, d.Name)
+		}
+	}
+	return meta, nil
 }
 
 func (c Client) DownloadTarget(dst io.Writer, path string, meta *data.FileMeta) error {
